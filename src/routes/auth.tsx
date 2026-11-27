@@ -1,3 +1,4 @@
+
 import { useNavigate } from "@tanstack/react-router";
 import {
   AlertTriangle,
@@ -17,6 +18,7 @@ import {
   useRegisterOwner,
   useResetLocalOwner,
 } from "../lib/queries";
+import { supabase } from "../lib/supabase";
 import { ThemeToggleButton } from "../lib/theme";
 
 export function AuthRoutePage() {
@@ -32,16 +34,82 @@ export function AuthRoutePage() {
   const [supabaseAction, setSupabaseAction] = useState<"login" | "register">("login");
   const [formError, setFormError] = useState<string | null>(null);
   const [formNotice, setFormNotice] = useState<string | null>(null);
+
   const [showResetPanel, setShowResetPanel] = useState(false);
   const [resetConfirmed, setResetConfirmed] = useState(false);
   const [resetKeyword, setResetKeyword] = useState("");
   const [resetError, setResetError] = useState<string | null>(null);
 
+  const [recoveryView, setRecoveryView] = useState<"none" | "request" | "password">("none");
+  const [recoveryPassword, setRecoveryPassword] = useState("");
+  const [recoveryPasswordConfirm, setRecoveryPasswordConfirm] = useState("");
+  const [recoveryBusy, setRecoveryBusy] = useState(false);
+
   useEffect(() => {
-    if (auth?.authenticated) {
+    if (!supabase) return;
+
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((event) => {
+      if (event === "PASSWORD_RECOVERY") {
+        setRecoveryView("password");
+        setFormError(null);
+        setFormNotice(null);
+      }
+    });
+
+    return () => subscription.unsubscribe();
+  }, []);
+
+  useEffect(() => {
+    if (!supabase) return;
+
+    let active = true;
+
+    async function checkRecoverySession() {
+      const params = new URLSearchParams(window.location.search);
+      const hashParams = new URLSearchParams(
+        window.location.hash.replace(/^#/, "")
+      );
+
+      const isRecoveryLink =
+        params.get("type") === "recovery" ||
+        hashParams.get("type") === "recovery" ||
+        params.has("code");
+
+      if (!isRecoveryLink) return;
+
+      // Supabase SDK memproses callback URL dan PKCE sesuai konfigurasi client.
+      const { data, error } = await supabase.auth.getSession();
+
+      if (!active) return;
+
+      if (error) {
+        setFormError(error.message);
+        return;
+      }
+
+      if (data.session) {
+        setRecoveryView("password");
+      } else {
+        setFormError(
+          "Sesi pemulihan tidak ditemukan. Silakan minta tautan pemulihan baru."
+        );
+      }
+    }
+
+    void checkRecoverySession();
+
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (auth?.authenticated && recoveryView === "none") {
       void navigate({ to: "/" });
     }
-  }, [auth?.authenticated, navigate]);
+  }, [auth?.authenticated, recoveryView, navigate]);
 
   const isSupabaseMode = auth?.mode === "supabase";
   const isRegistrationMode = isSupabaseMode
@@ -54,6 +122,7 @@ export function AuthRoutePage() {
     e.preventDefault();
     setFormError(null);
     setFormNotice(null);
+
     try {
       if (isRegistrationMode) {
         const res = await registerMutation.mutateAsync({
@@ -61,18 +130,22 @@ export function AuthRoutePage() {
           password,
           full_name: fullName,
         });
+
         if (res.needsEmailConfirmation) {
-          const msg = `Pendaftaran berhasil. Silakan buka kotak masuk ${email.trim()} dan klik tautan konfirmasi dari Supabase sebelum masuk.`;
-          setFormNotice(msg);
+          setFormNotice(
+            `Pendaftaran berhasil. Silakan buka kotak masuk ${email.trim()} dan klik tautan konfirmasi dari Supabase sebelum masuk.`
+          );
           setSupabaseAction("login");
           toast.success("Tautan konfirmasi telah dikirim ke email Anda.");
           return;
         }
+
         toast.success("Brankas pribadi Anda siap digunakan.");
       } else {
         await loginMutation.mutateAsync({ email, password });
         toast.success("Selamat datang kembali di brankas Anda.");
       }
+
       await navigate({ to: "/" });
     } catch (err) {
       const message =
@@ -82,20 +155,134 @@ export function AuthRoutePage() {
     }
   }
 
+  async function handleRequestRecovery(e: React.FormEvent) {
+    e.preventDefault();
+    setFormError(null);
+    setFormNotice(null);
+
+    if (!supabase) {
+      setFormError("Koneksi Supabase belum tersedia.");
+      return;
+    }
+
+    if (!email.trim()) {
+      setFormError("Masukkan alamat email akun Anda.");
+      return;
+    }
+
+    setRecoveryBusy(true);
+
+    try {
+      const { error } = await supabase.auth.resetPasswordForEmail(
+        email.trim(),
+        {
+          redirectTo: `${window.location.origin}/auth`,
+        }
+      );
+
+      if (error) throw error;
+
+      setFormNotice(
+        "Jika email tersebut terdaftar, tautan pemulihan akan dikirim. Periksa kotak masuk dan folder spam."
+      );
+      toast.success("Permintaan pemulihan kata sandi diproses.");
+    } catch (err) {
+      const message =
+        err instanceof Error
+          ? err.message
+          : "Gagal mengirim tautan pemulihan.";
+      setFormError(message);
+      toast.error(message);
+    } finally {
+      setRecoveryBusy(false);
+    }
+  }
+
+  async function handleUpdatePassword(e: React.FormEvent) {
+    e.preventDefault();
+    setFormError(null);
+    setFormNotice(null);
+
+    if (!supabase) {
+      setFormError("Koneksi Supabase belum tersedia.");
+      return;
+    }
+
+    if (recoveryPassword.length < 6) {
+      setFormError("Kata sandi minimal 6 karakter.");
+      return;
+    }
+
+    if (recoveryPassword !== recoveryPasswordConfirm) {
+      setFormError("Konfirmasi kata sandi tidak cocok.");
+      return;
+    }
+
+    setRecoveryBusy(true);
+
+    try {
+      const { data: sessionData, error: sessionError } =
+        await supabase.auth.getSession();
+
+      if (sessionError) throw sessionError;
+
+      if (!sessionData.session) {
+        throw new Error(
+          "Sesi pemulihan tidak ditemukan atau sudah kedaluwarsa. Silakan minta tautan baru."
+        );
+      }
+
+      const { error } = await supabase.auth.updateUser({
+        password: recoveryPassword,
+      });
+
+      if (error) throw error;
+
+      setRecoveryPassword("");
+      setRecoveryPasswordConfirm("");
+      setRecoveryView("none");
+
+      await supabase.auth.signOut();
+
+      window.history.replaceState(
+        {},
+        document.title,
+        window.location.pathname
+      );
+
+      setFormNotice(
+        "Kata sandi berhasil diperbarui. Silakan masuk menggunakan kata sandi baru."
+      );
+      toast.success("Kata sandi berhasil diperbarui.");
+    } catch (err) {
+      const message =
+        err instanceof Error
+          ? err.message
+          : "Gagal memperbarui kata sandi.";
+      setFormError(message);
+      toast.error(message);
+    } finally {
+      setRecoveryBusy(false);
+    }
+  }
+
   async function handleResetLocalOwner(e: React.FormEvent) {
     e.preventDefault();
     setResetError(null);
+
     try {
       await resetOwnerMutation.mutateAsync({
         confirmed: resetConfirmed,
         confirmation_text: resetKeyword,
       });
+
       setShowResetPanel(false);
       setResetConfirmed(false);
       setResetKeyword("");
       setFormError(null);
       setEmail("");
       setPassword("");
+
       toast.success(
         "Akun Owner lama berhasil dihapus. Silakan daftar ulang dengan email yang benar."
       );
@@ -110,11 +297,17 @@ export function AuthRoutePage() {
   const pending =
     registerMutation.isPending ||
     loginMutation.isPending ||
-    resetOwnerMutation.isPending;
+    resetOwnerMutation.isPending ||
+    recoveryBusy;
+
+  const inputClass =
+    "min-h-[44px] w-full rounded-xl border border-[#DCE4F0] bg-[#F4F7FB] px-3.5 py-2.5 text-sm text-[#06132F] placeholder:text-slate-400 focus:border-[#087BFF] focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#087BFF]/20 dark:border-[#1B3163] dark:bg-[#06132F] dark:text-white dark:placeholder:text-slate-500 dark:focus:border-[#19D8FF]";
+
+  const primaryButtonClass =
+    "flex min-h-[48px] w-full items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-[#087BFF] to-[#0066E0] px-4 py-3 text-sm font-semibold text-white shadow-md shadow-[#087BFF]/20 transition-all hover:brightness-110 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#19D8FF] disabled:opacity-60";
 
   return (
     <div className="relative flex min-h-screen flex-col items-center justify-center overflow-hidden bg-[#F4F7FB] px-4 py-10 transition-colors duration-200 dark:bg-[#040B1C]">
-      {/* Subtle EGO Ambient Glow */}
       <div
         aria-hidden="true"
         className="pointer-events-none absolute -top-28 left-1/2 h-80 w-80 -translate-x-1/2 rounded-full bg-[#087BFF]/12 blur-3xl dark:bg-[#19D8FF]/12"
@@ -125,7 +318,6 @@ export function AuthRoutePage() {
       </div>
 
       <div className="relative z-10 w-full max-w-md overflow-hidden rounded-3xl border border-[#DCE4F0] bg-white shadow-xl shadow-[#06132F]/8 dark:border-[#1B3163] dark:bg-[#091634] dark:shadow-none">
-        {/* Midnight Navy Fintech Header Strip */}
         <div className="ego-card-hero border-b border-[#1B3163] px-6 py-6 text-white sm:px-8">
           <div className="flex items-center gap-3.5">
             <EgoLogoMark size="lg" />
@@ -152,6 +344,116 @@ export function AuthRoutePage() {
               <Loader2 className="mr-2 h-4 w-4 animate-spin text-[#087BFF] dark:text-[#19D8FF]" />
               <span>Menyiapkan brankas Anda...</span>
             </div>
+          ) : recoveryView === "password" ? (
+            <form onSubmit={handleUpdatePassword} className="space-y-4">
+              <div>
+                <h2 className="text-lg font-bold text-[#06132F] dark:text-white">
+                  Buat Kata Sandi Baru
+                </h2>
+                <p className="mt-1 text-xs leading-relaxed text-slate-600 dark:text-[#C7D0E0]/75">
+                  Masukkan kata sandi baru untuk akun EGO Anda.
+                </p>
+              </div>
+
+              <input
+                type="password"
+                required
+                minLength={6}
+                autoComplete="new-password"
+                value={recoveryPassword}
+                onChange={(e) => setRecoveryPassword(e.target.value)}
+                placeholder="Kata sandi baru (minimal 6 karakter)"
+                className={inputClass}
+              />
+
+              <input
+                type="password"
+                required
+                minLength={6}
+                autoComplete="new-password"
+                value={recoveryPasswordConfirm}
+                onChange={(e) => setRecoveryPasswordConfirm(e.target.value)}
+                placeholder="Ulangi kata sandi baru"
+                className={inputClass}
+              />
+
+              {formError ? (
+                <p role="alert" className="text-xs text-rose-600">
+                  {formError}
+                </p>
+              ) : null}
+
+              <button
+                type="submit"
+                disabled={pending}
+                className={primaryButtonClass}
+              >
+                {pending ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : (
+                  <KeyRound className="h-4 w-4" />
+                )}
+                Simpan Kata Sandi Baru
+              </button>
+            </form>
+          ) : recoveryView === "request" ? (
+            <form onSubmit={handleRequestRecovery} className="space-y-4">
+              <div>
+                <h2 className="text-lg font-bold text-[#06132F] dark:text-white">
+                  Lupa Kata Sandi?
+                </h2>
+                <p className="mt-1 text-xs leading-relaxed text-slate-600 dark:text-[#C7D0E0]/75">
+                  Masukkan email akun EGO. Kami akan mengirim tautan pemulihan.
+                </p>
+              </div>
+
+              <input
+                type="email"
+                required
+                autoComplete="email"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                placeholder="Email akun EGO"
+                className={inputClass}
+              />
+
+              {formNotice ? (
+                <p role="status" className="text-xs text-[#087BFF] dark:text-[#19D8FF]">
+                  {formNotice}
+                </p>
+              ) : null}
+
+              {formError ? (
+                <p role="alert" className="text-xs text-rose-600">
+                  {formError}
+                </p>
+              ) : null}
+
+              <button
+                type="submit"
+                disabled={pending}
+                className={primaryButtonClass}
+              >
+                {pending ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : (
+                  <KeyRound className="h-4 w-4" />
+                )}
+                Kirim Tautan Pemulihan
+              </button>
+
+              <button
+                type="button"
+                onClick={() => {
+                  setRecoveryView("none");
+                  setFormError(null);
+                  setFormNotice(null);
+                }}
+                className="w-full py-2 text-xs font-medium text-slate-600 underline dark:text-[#C7D0E0]"
+              >
+                Kembali ke halaman masuk
+              </button>
+            </form>
           ) : (
             <>
               {isSupabaseMode ? (
@@ -177,6 +479,7 @@ export function AuthRoutePage() {
                   >
                     Masuk Owner
                   </button>
+
                   <button
                     type="button"
                     role="tab"
@@ -231,7 +534,7 @@ export function AuthRoutePage() {
                       value={fullName}
                       onChange={(e) => setFullName(e.target.value)}
                       placeholder="Owner Utama"
-                      className="min-h-[44px] w-full rounded-xl border border-[#DCE4F0] bg-[#F4F7FB] px-3.5 py-2.5 text-sm text-[#06132F] placeholder:text-slate-400 focus:border-[#087BFF] focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#087BFF]/20 dark:border-[#1B3163] dark:bg-[#06132F] dark:text-white dark:placeholder:text-slate-500 dark:focus:border-[#19D8FF]"
+                      className={inputClass}
                     />
                   </div>
                 ) : null}
@@ -250,7 +553,7 @@ export function AuthRoutePage() {
                     value={email}
                     onChange={(e) => setEmail(e.target.value)}
                     placeholder="owner@domain.id"
-                    className="min-h-[44px] w-full rounded-xl border border-[#DCE4F0] bg-[#F4F7FB] px-3.5 py-2.5 text-sm text-[#06132F] placeholder:text-slate-400 focus:border-[#087BFF] focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#087BFF]/20 dark:border-[#1B3163] dark:bg-[#06132F] dark:text-white dark:placeholder:text-slate-500 dark:focus:border-[#19D8FF]"
+                    className={inputClass}
                   />
                 </div>
 
@@ -269,7 +572,7 @@ export function AuthRoutePage() {
                     value={password}
                     onChange={(e) => setPassword(e.target.value)}
                     placeholder="Minimal 6 karakter"
-                    className="min-h-[44px] w-full rounded-xl border border-[#DCE4F0] bg-[#F4F7FB] px-3.5 py-2.5 text-sm text-[#06132F] placeholder:text-slate-400 focus:border-[#087BFF] focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#087BFF]/20 dark:border-[#1B3163] dark:bg-[#06132F] dark:text-white dark:placeholder:text-slate-500 dark:focus:border-[#19D8FF]"
+                    className={inputClass}
                   />
                 </div>
 
@@ -294,22 +597,36 @@ export function AuthRoutePage() {
                 <button
                   type="submit"
                   disabled={pending}
-                  className="flex min-h-[48px] w-full items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-[#087BFF] to-[#0066E0] px-4 py-3 text-sm font-semibold text-white shadow-md shadow-[#087BFF]/20 transition-all hover:brightness-110 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#19D8FF] disabled:opacity-60"
+                  className={primaryButtonClass}
                 >
                   {pending ? (
-                    <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
+                    <Loader2 className="h-4 w-4 animate-spin" />
                   ) : isRegistrationMode ? (
-                    <UserPlus className="h-4 w-4" aria-hidden="true" />
+                    <UserPlus className="h-4 w-4" />
                   ) : (
-                    <KeyRound className="h-4 w-4" aria-hidden="true" />
+                    <KeyRound className="h-4 w-4" />
                   )}
-                  <span>
-                    {isRegistrationMode
-                      ? "Daftarkan Owner Tunggal"
-                      : "Buka Brankas Owner"}
-                  </span>
+                  {isRegistrationMode
+                    ? "Daftarkan Owner Tunggal"
+                    : "Buka Brankas Owner"}
                 </button>
               </form>
+
+              {isSupabaseMode && supabaseAction === "login" ? (
+                <div className="mt-3 text-right">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setRecoveryView("request");
+                      setFormError(null);
+                      setFormNotice(null);
+                    }}
+                    className="text-xs font-semibold text-[#087BFF] underline underline-offset-4 hover:text-[#0066E0] dark:text-[#19D8FF]"
+                  >
+                    Lupa Kata Sandi?
+                  </button>
+                </div>
+              ) : null}
 
               {!isSupabaseMode && !isRegistrationMode ? (
                 <div className="mt-5 border-t border-[#DCE4F0] pt-4 dark:border-[#1B3163]">
@@ -357,7 +674,9 @@ export function AuthRoutePage() {
                           htmlFor="reset-owner-keyword"
                           className="block text-xs font-medium text-slate-700 dark:text-[#C7D0E0]"
                         >
-                          Ketik <span className="font-mono font-semibold">HAPUS</span> untuk konfirmasi
+                          Ketik{" "}
+                          <span className="font-mono font-semibold">HAPUS</span>{" "}
+                          untuk konfirmasi
                         </label>
                         <input
                           id="reset-owner-keyword"
@@ -366,7 +685,7 @@ export function AuthRoutePage() {
                           onChange={(e) => setResetKeyword(e.target.value)}
                           placeholder="HAPUS"
                           autoComplete="off"
-                          className="min-h-[40px] w-full rounded-xl border border-rose-200 bg-white px-3 py-2 text-sm text-[#06132F] placeholder:text-slate-400 focus:border-rose-500 focus:outline-none dark:border-rose-500/30 dark:bg-[#06132F] dark:text-white"
+                          className={inputClass}
                         />
                       </div>
 
@@ -386,12 +705,13 @@ export function AuthRoutePage() {
                           className="inline-flex min-h-[38px] items-center gap-1.5 rounded-xl bg-rose-600 px-3.5 py-2 text-xs font-semibold text-white transition-colors hover:bg-rose-700 disabled:opacity-60"
                         >
                           {resetOwnerMutation.isPending ? (
-                            <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
+                            <Loader2 className="h-3.5 w-3.5 animate-spin" />
                           ) : (
-                            <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
+                            <Trash2 className="h-3.5 w-3.5" />
                           )}
-                          <span>Hapus Akun Owner &amp; Daftar Ulang</span>
+                          Hapus Akun Owner &amp; Daftar Ulang
                         </button>
+
                         <button
                           type="button"
                           onClick={() => {
@@ -411,7 +731,7 @@ export function AuthRoutePage() {
               ) : null}
 
               <div className="mt-6 flex items-center gap-2 border-t border-[#DCE4F0] pt-4 text-xs text-slate-500 dark:border-[#1B3163] dark:text-[#C7D0E0]/65">
-                <Lock className="h-3.5 w-3.5 shrink-0 text-[#087BFF] dark:text-[#19D8FF]" aria-hidden="true" />
+                <Lock className="h-3.5 w-3.5 shrink-0 text-[#087BFF] dark:text-[#19D8FF]" />
                 <span>
                   Penyimpanan:{" "}
                   {auth?.mode === "supabase"
